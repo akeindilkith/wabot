@@ -6,14 +6,82 @@ const {
 } = require("baileys");
 
 const P = require("pino");
-const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode");
+const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const Fuse = require("fuse.js");
 
 const FILES = path.join(__dirname, "files");
 
-// Commands and acceptable variations
+// =========================
+// QR WEB SERVER
+// =========================
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+let currentQR = null;
+
+app.get("/", (req, res) => {
+  if (!currentQR) {
+    return res.send(`
+      <h2>WhatsApp Bot</h2>
+      <p>QR code is not available yet.</p>
+      <p>Check again in a few seconds.</p>
+    `);
+  }
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>WhatsApp Bot QR</title>
+      <style>
+        body {
+          font-family: Arial;
+          text-align: center;
+          background: #f5f5f5;
+          padding: 30px;
+        }
+
+        .box {
+          background: white;
+          max-width: 400px;
+          margin: auto;
+          padding: 25px;
+          border-radius: 20px;
+          box-shadow: 0 5px 25px rgba(0,0,0,.15);
+        }
+
+        img {
+          width: 100%;
+          max-width: 350px;
+        }
+      </style>
+    </head>
+
+    <body>
+      <div class="box">
+        <h2>📱 Link WhatsApp</h2>
+        <p>Open WhatsApp → Linked devices → Link a device</p>
+        <img src="${currentQR}">
+        <p>Scan this QR code</p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`QR server running on port ${PORT}`);
+});
+
+// =========================
+// COMMANDS
+// =========================
+
 const commands = [
   {
     names: [
@@ -52,7 +120,10 @@ const commands = [
   }
 ];
 
-// Clean user's message
+// =========================
+// CLEAN MESSAGE
+// =========================
+
 function clean(text) {
   return text
     .toLowerCase()
@@ -61,7 +132,10 @@ function clean(text) {
     .replace(/\s+/g, " ");
 }
 
-// Find command using fuzzy matching
+// =========================
+// FUZZY SEARCH
+// =========================
+
 const fuse = new Fuse(
   commands.flatMap(command =>
     command.names.map(name => ({
@@ -84,6 +158,10 @@ function findCommand(text) {
 
   return result[0].item.command;
 }
+
+// =========================
+// SEND FILES
+// =========================
 
 async function sendCommand(sock, jid, command) {
 
@@ -114,12 +192,17 @@ async function sendCommand(sock, jid, command) {
   }
 }
 
+// =========================
+// START WHATSAPP
+// =========================
+
 async function startBot() {
 
   const { state, saveCreds } =
     await useMultiFileAuthState("./auth");
 
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } =
+    await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
@@ -128,39 +211,68 @@ async function startBot() {
     printQRInTerminal: false
   });
 
-  // Save login information
   sock.ev.on("creds.update", saveCreds);
 
-  // Connection handling
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+  sock.ev.on(
+    "connection.update",
+    ({ connection, lastDisconnect, qr }) => {
 
-    if (qr) {
-      console.log("\nSCAN THIS QR WITH WHATSAPP:\n");
-      qrcode.generate(qr, { small: true });
-    }
+      if (qr) {
 
-    if (connection === "open") {
-      console.log("\n✅ BOT CONNECTED!");
-    }
+        console.log("New WhatsApp QR generated.");
 
-    if (connection === "close") {
+        QRCode.toDataURL(qr, (err, url) => {
 
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
+          if (err) {
+            console.error("QR generation error:", err);
+            return;
+          }
 
-      console.log("Connection closed.");
+          currentQR = url;
 
-      if (shouldReconnect) {
-        console.log("Reconnecting...");
-        startBot();
-      } else {
-        console.log("❌ Logged out. Delete auth folder and login again.");
+          console.log(
+            "Open the service URL in your browser to scan the QR."
+          );
+        });
+      }
+
+      if (connection === "open") {
+
+        currentQR = null;
+
+        console.log("\n✅ BOT CONNECTED!\n");
+      }
+
+      if (connection === "close") {
+
+        const shouldReconnect =
+          lastDisconnect?.error?.output?.statusCode !==
+          DisconnectReason.loggedOut;
+
+        console.log("Connection closed.");
+
+        if (shouldReconnect) {
+
+          console.log("Reconnecting...");
+
+          setTimeout(() => {
+            startBot();
+          }, 3000);
+
+        } else {
+
+          console.log(
+            "❌ Logged out. Delete auth folder and login again."
+          );
+        }
       }
     }
-  });
+  );
 
-  // Incoming messages
+  // =========================
+  // INCOMING MESSAGES
+  // =========================
+
   sock.ev.on("messages.upsert", async ({ messages }) => {
 
     const msg = messages[0];
@@ -170,7 +282,6 @@ async function startBot() {
 
     const jid = msg.key.remoteJid;
 
-    // Ignore groups
     if (jid.endsWith("@g.us")) return;
 
     const message =
@@ -185,6 +296,7 @@ async function startBot() {
     const command = findCommand(message);
 
     if (!command) {
+
       console.log("No matching command.");
       return;
     }
@@ -196,14 +308,20 @@ async function startBot() {
 
     try {
 
-      await sendCommand(sock, jid, command);
+      await sendCommand(
+        sock,
+        jid,
+        command
+      );
 
       console.log("✅ Files sent.");
 
     } catch (error) {
 
-      console.error("Send error:", error);
-
+      console.error(
+        "Send error:",
+        error
+      );
     }
   });
 }
